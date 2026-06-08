@@ -10,6 +10,146 @@ import matplotlib.gridspec as gridspec
 from scipy.stats import gaussian_kde
 import pymc.sampling.jax as pmjax
 
+import json
+import pandas as pd
+import matplotlib.pyplot as plt
+import arviz as az
+
+# Meridian Core Imports
+from meridian.data import data_frame_input_data_builder
+from meridian.model import model, spec
+from meridian.analysis import analyzer
+
+def run_meridian_analysis(csv_path: str, config_path: str, out_plot_prefix: str):
+    # ---------------------------------------------------------
+    # 1. Load Data & Config
+    # ---------------------------------------------------------
+    df = pd.read_csv(csv_path)
+    with open(config_path, "r") as f:
+        config = json.load(f)
+        
+    # Meridian often requires 'geo' and 'population' columns
+    if "geo" not in df.columns:
+        df["geo"] = "national"
+    if "population" not in df.columns:
+        df["population"] = 1.0
+
+    # --- NEW: Generate a mock date string for Meridian ---
+    # We pick an arbitrary start date and add 'week' number of weeks to it.
+    start_date = pd.to_datetime("2023-01-01")
+    df["mock_date"] = start_date + pd.to_timedelta(df["week"], unit="W")
+    df["mock_date"] = df["mock_date"].dt.strftime("%Y-%m-%d")
+    # -----------------------------------------------------
+
+    # ---------------------------------------------------------
+    # 2. Build Meridian Input Data
+    # ---------------------------------------------------------
+    media_channels = ["tv_spend", "digital_spend", "radio_spend"]
+    control_vars = ["interest_rate", "comp_tv_spend"] 
+
+    builder = data_frame_input_data_builder.DataFrameInputDataBuilder(
+        kpi_type="non_revenue", 
+        default_kpi_column="sales"
+    )
+
+    builder = (
+        builder.with_kpi(df, kpi_col="sales", geo_col="geo", time_col="mock_date")
+        .with_media(
+            df, 
+            media_cols=media_channels, 
+            media_spend_cols=media_channels, 
+            media_channels=media_channels,  # <-- This was the missing argument
+            geo_col="geo", 
+            time_col="mock_date"
+        )
+        .with_controls(df, control_cols=control_vars, geo_col="geo", time_col="mock_date")
+        .with_population(df, population_col="population", geo_col="geo")
+    )
+    
+    input_data = builder.build()
+
+    # ---------------------------------------------------------
+    # 3. Model Specification & Fitting
+    # ---------------------------------------------------------
+    # We initialize the default model specification. You can inject custom
+    # prior_distribution.PriorDistribution() here if needed.
+    model_spec = spec.ModelSpec()
+    mmm = model.Meridian(input_data=input_data, model_spec=model_spec)
+    
+    print("Fitting the Meridian model via NUTS. This may take a few minutes...")
+    # Adjust chains and draws based on your hardware (GPU recommended for Meridian)
+    mmm.sample_posterior(n_chains=4, n_adapt=1000, n_burnin=1000, n_keep=1000, seed=42)
+
+    # ---------------------------------------------------------
+    # 4. Parameter Recovery: Posteriors vs. Ground Truth
+    # ---------------------------------------------------------
+    trace = mmm.inference_data
+    channel_params = config.get("channel_params", {})
+    
+    fig, axes = plt.subplots(len(media_channels), 2, figsize=(14, 5 * len(media_channels)))
+    fig.subplots_adjust(hspace=0.4, wspace=0.3)
+
+    for i, ch in enumerate(media_channels):
+        if ch not in channel_params:
+            continue
+            
+        # Ground truth values from simple_config.json
+        gt_theta = channel_params[ch].get("theta")
+        gt_alpha = channel_params[ch].get("alpha")
+        
+        try:
+            # Extract samples using ArviZ from Meridian's posterior
+            # Note: Parameter names map to Meridian's internal naming schema
+            adstock_samples = trace.posterior["adstock_decay"].sel(media_channel=ch).values.flatten()
+            hill_samples = trace.posterior["hill_slope"].sel(media_channel=ch).values.flatten()
+
+            # Plot Adstock Decay (Theta)
+            az.plot_posterior(adstock_samples, ax=axes[i, 0], point_estimate="mean", ref_val=gt_theta)
+            axes[i, 0].set_title(f"{ch} - Adstock Decay (Recovery)")
+
+            # Plot Hill Slope (Alpha)
+            az.plot_posterior(hill_samples, ax=axes[i, 1], point_estimate="mean", ref_val=gt_alpha)
+            axes[i, 1].set_title(f"{ch} - Hill Slope (Recovery)")
+            
+        except KeyError as e:
+            print(f"Skipping {ch} plots. Trace variable not found: {e}")
+
+    plt.suptitle("Meridian Parameter Recovery vs Ground Truth", fontsize=16)
+    plt.savefig(f"{out_plot_prefix}_parameter_recovery.png", bbox_inches="tight")
+    plt.close()
+
+    # ---------------------------------------------------------
+    # 5. Response & Profit Curves
+    # ---------------------------------------------------------
+    print("Generating Response and Profit Curves...")
+    
+    # Meridian's Analyzer class handles the extraction of expected responses
+    mmm_analyzer = analyzer.Analyzer(mmm)
+    
+    # Extract the response curve data
+    # (Meridian provides standard evaluation grids for this)
+    response_data = mmm_analyzer.expected_response_curves()
+    
+    fig_rc, ax_rc = plt.subplots(figsize=(10, 6))
+    for ch in media_channels:
+        # Plotting the mean expected response across the spend grid
+        spend_grid = response_data[ch]["spend_grid"]
+        response_mean = response_data[ch]["response_mean"]
+        
+        ax_rc.plot(spend_grid, response_mean, label=f"{ch} Response", linewidth=2)
+        
+    ax_rc.set_title("Media Response Curves (Saturation)")
+    ax_rc.set_xlabel("Spend ($)")
+    ax_rc.set_ylabel("Incremental Sales")
+    ax_rc.legend()
+    ax_rc.grid(True, alpha=0.3)
+    
+    plt.savefig(f"{out_plot_prefix}_response_curves.png", bbox_inches="tight")
+    plt.close()
+
+    print(f"Done! Plots saved with prefix: {out_plot_prefix}")
+    return mmm
+
 def geometric_adstock_pt(spend: pt.TensorVariable, theta: pt.TensorVariable) -> pt.TensorVariable:
     """PyTensor implementation of geometric adstock using scan."""
     def step(x_t: pt.TensorVariable, y_tm1: pt.TensorVariable, theta: pt.TensorVariable) -> pt.TensorVariable:

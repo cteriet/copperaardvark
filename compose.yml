@@ -1,0 +1,8 @@
+services:
+  meridian-env:
+    build: .
+    container_name: meridian_container
+    volumes:
+      # Notice the :z added at the end here
+      - .:/app:z
+    command: tail -f /dev/null

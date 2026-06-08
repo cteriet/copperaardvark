@@ -5,7 +5,7 @@
 python concatenate_files.py -i simulation -o simulation.txt
 ```
 
-## main.py commands
+## main.py commands venv
 
 ### Generating data
 
@@ -30,4 +30,16 @@ python main.py analyze -d output/my_scenario.csv -c configurations/config.json -
 ### Create response curves
 ```bash
 python main.py plot-response -d output/my_scenario.csv -c configurations/config.json -t output/trace.nc -p output/response_curve_plot.png
+```
+
+## main.py command podman
+
+### Generating data with podman-compose
+```bash
+podman-compose exec meridian-env python main.py generate -c configurations/simple_config.json -d output/my_scenario.csv -p output/my_scenario_plot.png
+```
+
+### Generating a meridian analysis
+```bash
+podman-compose exec meridian-env python main.py meridian-analyze -c configurations/simple_config.json -d output/my_scenario.csv -p output/meridian_eval
 ```

@@ -1,0 +1,14 @@
+google-meridian[and-cuda]
+numpy
+pandas
+matplotlib
+jupyterlab
+arviz
+pymc
+pytensor
+jax
+jaxlib
+
+# Required for saving traces
+h5netcdf
+h5py

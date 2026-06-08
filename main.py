@@ -7,7 +7,7 @@ from simulation.config import MMMConfig
 from simulation.simulation import simulate_mmm_data, calculate_true_sales
 from simulation.plotting import plot_mmm_features
 from simulation.analysis import (
-    build_mmm_model, run_mmm_analysis, 
+    build_mmm_model, run_meridian_analysis, run_mmm_analysis, 
     plot_parameter_recovery, plot_posterior_predictive,
     plot_total_sales_counterfactual,
     plot_response_curves
@@ -56,6 +56,18 @@ def cmd_plot(args: argparse.Namespace) -> None:
         true_transforms={}, 
         price_per_unit=price,
         save_path=args.out_plot
+    )
+
+def cmd_meridian_analyze(args: argparse.Namespace) -> None:
+    """Command to run the Google Meridian analysis pipeline."""
+    print(f"Starting Meridian analysis with config: {args.config}")
+    
+    # Assuming run_meridian_analysis is either defined in this file 
+    # or imported from your analysis module
+    run_meridian_analysis(
+        csv_path=args.csv,
+        config_path=args.config,
+        out_plot_prefix=args.out_prefix
     )
 
 def cmd_analyze(args: argparse.Namespace) -> None:
@@ -158,6 +170,14 @@ def main() -> None:
     parser_plot.add_argument("-c", "--config", default=None)
     parser_plot.add_argument("-p", "--out-plot", required=True)
 
+    # Meridian Analysis command
+    parser_meridian = subparsers.add_parser("meridian-analyze", help="Run Google Meridian analysis and parameter recovery.")
+    parser_meridian.add_argument("-d", "--csv", required=True, help="Base CSV containing data")
+    parser_meridian.add_argument("-c", "--config", required=True, help="Config JSON")
+    parser_meridian.add_argument("-p", "--out-prefix", required=True, help="Prefix path for saved Meridian plots")
+
+    args = parser.parse_args()
+
     # Analysis command
     parser_ana = subparsers.add_parser("analyze")
     parser_ana.add_argument("-d", "--csv", required=True)
@@ -195,6 +215,8 @@ def main() -> None:
         cmd_predict_cf(args)
     elif args.command == "plot-response":
         cmd_plot_response(args)
+    elif args.command == "meridian-analyze":
+        cmd_meridian_analyze(args)
     else:
         raise ValueError(f"Unknown command: {args.command}")
 
