@@ -1,0 +1,852 @@
+
+################################################################################
+# FILE: /home/cteriet/Documents/projects/mmm/simulation/config.py
+################################################################################
+
+from dataclasses import dataclass, field
+from typing import Literal, Dict, List
+
+@dataclass
+class MMMConfig:
+    """Configuration object for MMM Data Simulation."""
+    n_weeks: int = 104
+    base_sales: float = 1000.0
+    random_seed: int = 42
+    price_per_unit: float = 10.0
+    
+    # Column Names
+    col_time: str = 'week'
+    col_target: str = 'sales'
+
+    # Controls for interest rate variable
+    col_interest_rate: str = 'interest_rate'
+    interest_rate_type: Literal['independent', 'sticky'] = 'sticky'
+    interest_rate_mean: float = 3.5
+    interest_rate_std: float = 0.5  
+    interest_rate_gp_length_scale: float = 26.0  
+    interest_rate_gp_variance: float = 0.25 
+    interest_rate_min_clip: float = 0.0
+    interest_rate_coef: float = -50.0
+    
+    # --- Pricing Flag Parameters ---
+    col_cheapest_flag: str = 'we_are_cheapest'
+    cheapest_flag_type: Literal['independent', 'sticky'] = 'sticky'
+    we_are_cheapest_prob: float = 0.4
+    cheapest_flag_gp_length_scale: float = 12.0 
+    
+    # Unified Channels
+    channels: List[str] = field(default_factory=lambda: [
+        "tv_spend", "digital_spend", "radio_spend", "comp_tv_spend"
+    ])
+    
+    # Explicit state-dependent coefficients per channel
+    channel_params: Dict[str, Dict[str, float]] = field(default_factory=lambda: {
+        "tv_spend": {
+            "spend_prob": 0.2, "spend_mean": 5000.0, "spend_std": 2000.0, "spend_min_clip": 100.0,
+            "theta": 0.7, "alpha": 2.0, "gamma": 5000.0, 
+            "coef_if_cheapest": 1.0, "coef_if_not_cheapest": 0.6  # High penalty if not cheapest
+        },
+        "digital_spend": {
+            "spend_prob": 0.8, "spend_mean": 2000.0, "spend_std": 800.0, "spend_min_clip": 50.0,
+            "theta": 0.3, "alpha": 1.5, "gamma": 2000.0, 
+            "coef_if_cheapest": 1.5, "coef_if_not_cheapest": 1.0  # Moderate penalty
+        },
+        "radio_spend": {
+            "spend_prob": 0.4, "spend_mean": 1500.0, "spend_std": 500.0, "spend_min_clip": 0.0,
+            "theta": 0.5, "alpha": 1.8, "gamma": 1000.0, 
+            "coef_if_cheapest": 0.5, "coef_if_not_cheapest": 0.5  # No interaction effect!
+        },
+        "comp_tv_spend": {
+            "spend_prob": 0.3, "spend_mean": 6000.0, "spend_std": 2500.0, "spend_min_clip": 200.0,
+            "theta": 0.6, "alpha": 2.0, "gamma": 6000.0, 
+            "coef_if_cheapest": 0.1, "coef_if_not_cheapest": -0.3 # Halo vs Cannibalization
+        }
+    })
+    
+    # Latent components
+    trend_type: Literal['zero', 'linear', 'spline', 'gp'] = 'gp'
+    trend_linear_slope: float = 5.0
+    trend_spline_knots: List[float] = field(default_factory=lambda: [1/3, 2/3])
+    trend_spline_slopes: List[float] = field(default_factory=lambda: [10.0, -15.0])
+    trend_gp_length_scale: float = 20.0
+    trend_gp_variance: float = 50000.0 
+    
+    seasonality_amplitude_4w: float = 50.0
+    seasonality_amplitude_52w: float = 200.0
+
+    noise_std: float = 100.0
+
+################################################################################
+# FILE: /home/cteriet/Documents/projects/mmm/simulation/generators.py
+################################################################################
+
+import numpy as np
+from simulation.config import MMMConfig
+
+def generate_gp(n_weeks: int, length_scale: float, variance: float, rng: np.random.Generator) -> np.ndarray:
+    """Core helper function to generate a Gaussian Process."""
+    x = np.arange(n_weeks)[:, None]
+    K = np.exp(-0.5 * (x - x.T)**2 / (length_scale**2)) * variance
+    # Add numerical jitter to the diagonal to ensure matrix is positive semi-definite
+    K += 1e-6 * np.eye(n_weeks) 
+    return rng.multivariate_normal(np.zeros(n_weeks), K)
+
+def generate_interest_rate(config: MMMConfig, rng: np.random.Generator) -> np.ndarray:
+    """Generates the interest rate variable based on the requested dynamics."""
+    if config.interest_rate_type == 'independent':
+        rates = rng.normal(config.interest_rate_mean, config.interest_rate_std, config.n_weeks)
+    elif config.interest_rate_type == 'sticky':
+        gp = generate_gp(config.n_weeks, config.interest_rate_gp_length_scale, config.interest_rate_gp_variance, rng)
+        rates = config.interest_rate_mean + gp
+    else:
+        raise ValueError(f"Unknown interest_rate_type: {config.interest_rate_type}")
+    
+    return np.clip(rates, config.interest_rate_min_clip, None)
+
+def generate_cheapest_flag(config: MMMConfig, rng: np.random.Generator) -> np.ndarray:
+    """Generates the boolean pricing flag based on the requested dynamics."""
+    if config.cheapest_flag_type == 'independent':
+        return rng.binomial(1, config.we_are_cheapest_prob, config.n_weeks)
+    elif config.cheapest_flag_type == 'sticky':
+        # Generate a standard GP
+        gp = generate_gp(config.n_weeks, config.cheapest_flag_gp_length_scale, 1.0, rng)
+        # Find the value at which exactly `we_are_cheapest_prob` % of the data is above the threshold
+        threshold = np.percentile(gp, 100 * (1 - config.we_are_cheapest_prob))
+        return (gp > threshold).astype(int)
+    else:
+        raise ValueError(f"Unknown cheapest_flag_type: {config.cheapest_flag_type}")
+
+def generate_spiky_spend(n_weeks: int, prob: float, mean: float, std: float, min_clip: float, rng: np.random.Generator) -> np.ndarray:
+    """Generates clipped normal distributed marketing expenses at random intervals."""
+    spikes = rng.binomial(1, prob, n_weeks)
+    amounts = rng.normal(mean, std, n_weeks)
+    amounts = np.clip(amounts, min_clip, None) 
+    return spikes * amounts
+
+def generate_trend(config: MMMConfig, rng: np.random.Generator) -> np.ndarray:
+    """Generates the trend variable based on the requested dynamics."""
+    n_weeks = config.n_weeks
+    x = np.arange(n_weeks)
+    
+    if config.trend_type == 'zero':
+        return np.zeros(n_weeks)
+    elif config.trend_type == 'linear':
+        return x * config.trend_linear_slope
+    elif config.trend_type == 'spline':
+        y = np.zeros(n_weeks)
+        for knot_prop, slope in zip(config.trend_spline_knots, config.trend_spline_slopes):
+            knot_idx = int(n_weeks * knot_prop)
+            y[knot_idx:] += (x[knot_idx:] - knot_idx) * slope
+        return y
+    elif config.trend_type == 'gp':
+        return generate_gp(n_weeks, config.trend_gp_length_scale, config.trend_gp_variance, rng)
+    else:
+        raise ValueError(f"Unknown trend_type: {config.trend_type}")
+
+def generate_seasonality(n_weeks: int, amp_4w: float, amp_52w: float) -> np.ndarray:
+    """Generate a 4 week and 52 week seasonality trend."""
+    t = np.arange(n_weeks)
+    season_4w = amp_4w * np.sin(2 * np.pi * t / 4)
+    season_52w = amp_52w * np.sin(2 * np.pi * t / 52)
+    return season_4w + season_52w
+
+################################################################################
+# FILE: /home/cteriet/Documents/projects/mmm/simulation/plotting.py
+################################################################################
+
+import math
+import pandas as pd
+import matplotlib.pyplot as plt
+from typing import Dict, List, Optional
+
+def plot_mmm_features(df: pd.DataFrame,
+                      channels: List[str],
+                      true_transforms: Dict, 
+                      price_per_unit: float,
+                      estimated_transforms: Optional[Dict] = None,
+                      time_col: str = 'week',
+                      target_col: str = 'sales',
+                      control_cols: Optional[List[str]] = None,
+                      binary_cols: Optional[List[str]] = None,
+                      trend_key: Optional[str] = 'trend',
+                      save_path: Optional[str] = None):
+    """
+    Plots raw spend, controls, true latent effects, and estimated models 
+    in a dynamic grid layout.
+    """
+    # 1. Increase global font sizes for readability
+    plt.rcParams.update({
+        'font.size': 12, 
+        'axes.titlesize': 14, 
+        'axes.labelsize': 12,
+        'legend.fontsize': 10
+    })
+
+    # Default to our known controls if none are explicitly passed
+    control_cols = control_cols or ['interest_rate']
+    binary_cols = binary_cols or ['we_are_cheapest']
+
+    # 2. Calculate Grid Layout dimensions
+    # We plot: 1 (Sales) + 1 (Trend) + Controls + Binary + Channels
+    n_plots = 2 + len(control_cols) + len(binary_cols) + len(channels)
+    cols = 2
+    rows = math.ceil(n_plots / cols)
+
+    fig, axes = plt.subplots(rows, cols, figsize=(8 * rows, 5 * rows))
+    axes = axes.flatten() # Flatten so we can iterate linearly through a 1D array
+
+    time_data = df[time_col]
+    plot_idx = 0
+
+# ---------------------------------------------------------
+    # Plot 1: Target Variable (Sales)
+    # ---------------------------------------------------------
+    ax = axes[plot_idx]
+    ax.plot(time_data, df[target_col], label=f'Total {target_col.title()} (Observed)', color='black', linewidth=2)
+    ax.set_title(f"Observed {target_col.title()}")
+    ax.legend(loc='upper left')
+    ax.grid(alpha=0.3)
+    
+    sec_ax = ax.secondary_yaxis('right', functions=(lambda x: x * price_per_unit, lambda x: x * price_per_unit))
+    sec_ax.set_ylabel("Money Earned ($)")
+    
+    plot_idx += 1
+
+    # ---------------------------------------------------------
+    # Plot 2: Latent Trend (True vs Estimated)
+    # ---------------------------------------------------------
+    ax = axes[plot_idx]
+    if trend_key and 'latent' in true_transforms and trend_key in true_transforms['latent']:
+        ax.plot(time_data, true_transforms['latent'][trend_key], '--', label='True Trend', color='gray', linewidth=2)
+        
+        # Overlay Estimated Trend if provided
+        if estimated_transforms and 'latent' in estimated_transforms and trend_key in estimated_transforms['latent']:
+            ax.plot(time_data, estimated_transforms['latent'][trend_key], ':', 
+                    label='Estimated Trend (MCMC)', color='orange', linewidth=3)
+            
+        ax.set_title("Underlying Trend")
+        ax.legend(loc='upper left')
+    else:
+        ax.set_title("Underlying Trend (Not Found)")
+    ax.grid(alpha=0.3)
+    plot_idx += 1
+
+    # ---------------------------------------------------------
+    # Plot 3: Continuous Controls
+    # ---------------------------------------------------------
+    for ctrl in control_cols:
+        ax = axes[plot_idx]
+        ax.plot(time_data, df[ctrl], color='purple', linewidth=2, label=ctrl.replace('_', ' ').title())
+        ax.set_title(f"Control Variable: {ctrl.replace('_', ' ').title()}")
+        ax.legend(loc='upper left')
+        ax.grid(alpha=0.3)
+        plot_idx += 1
+
+    # ---------------------------------------------------------
+    # Plot 4: Binary/Step Controls
+    # ---------------------------------------------------------
+    for bin_col in binary_cols:
+        ax = axes[plot_idx]
+        ax.step(time_data, df[bin_col], color='red', where='mid', linewidth=2, label=bin_col.replace('_', ' ').title())
+        ax.set_yticks([0, 1])
+        ax.set_title(f"Binary Flag: {bin_col.replace('_', ' ').title()}")
+        ax.legend(loc='upper left')
+        ax.grid(alpha=0.3)
+        plot_idx += 1
+
+    # ---------------------------------------------------------
+    # Plot 5: Channels (Spend vs Transformations)
+    # ---------------------------------------------------------
+    for ch in channels:
+        ax = axes[plot_idx]
+        ax2 = ax.twinx()
+        
+        # Raw Spend Bar Chart
+        ax.bar(time_data, df[ch], alpha=0.3, color='blue', label=f'Raw {ch}')
+        
+        # True Transformation Line (FIXED)
+        if true_transforms and ch in true_transforms:
+            true_contrib = true_transforms[ch]['saturated_contribution']
+            ax2.plot(time_data, true_contrib, color='green', linewidth=2, label='True Saturated Contribution')
+        
+        # Estimated Transformation Line & HDI Fill
+        if estimated_transforms and ch in estimated_transforms:
+            est_contrib = estimated_transforms[ch]['saturated_contribution']
+            ax2.plot(time_data, est_contrib, color='orange', linestyle=':', 
+                     linewidth=3, label='Estimated Contribution')
+            
+            if 'lower' in estimated_transforms[ch] and 'upper' in estimated_transforms[ch]:
+                ax2.fill_between(time_data, 
+                                 estimated_transforms[ch]['lower'], 
+                                 estimated_transforms[ch]['upper'], 
+                                 color='orange', alpha=0.2)
+
+        ax.set_ylabel("Spend Amount ($)")
+        ax2.set_ylabel("Sales Contribution")
+        ax.set_title(f"Spend vs Contribution: {ch.replace('_', ' ').title()}")
+        
+        # Combine legends from both axes
+        lines_1, labels_1 = ax.get_legend_handles_labels()
+        lines_2, labels_2 = ax2.get_legend_handles_labels()
+        if lines_1 or lines_2: # Only draw legend if there's something to show
+            ax.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper left')
+            
+        ax.grid(alpha=0.3)
+        plot_idx += 1
+
+    # ---------------------------------------------------------
+    # Clean up and Save/Show
+    # ---------------------------------------------------------
+    # If we have an odd number of plots, hide the empty final subplot
+    for i in range(plot_idx, len(axes)):
+        fig.delaxes(axes[i])
+        
+    plt.tight_layout(pad=3.0)
+    
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight', dpi=300)
+        print(f"Plot saved to: {save_path}")
+    else:
+        plt.show()
+        
+    plt.close()
+
+################################################################################
+# FILE: /home/cteriet/Documents/projects/mmm/simulation/simulation.py
+################################################################################
+
+import numpy as np
+import pandas as pd
+from typing import Dict, Tuple
+from simulation.config import MMMConfig
+from simulation.generators import (
+    generate_spiky_spend, generate_trend, generate_seasonality, 
+    generate_interest_rate, generate_cheapest_flag
+)
+from simulation.transformation import geometric_adstock, hill_function
+
+def simulate_mmm_data(config: MMMConfig) -> Tuple[pd.DataFrame, Dict[str, np.ndarray]]:
+    rng = np.random.default_rng(config.random_seed)
+    n = config.n_weeks
+    
+    # 1. Initialize DataFrame
+    df = pd.DataFrame({config.col_time: np.arange(n)})
+    
+    df[config.col_interest_rate] = generate_interest_rate(config, rng)
+    df[config.col_cheapest_flag] = generate_cheapest_flag(config, rng)
+    
+    # 2. Latent Variables
+    trend = generate_trend(config, rng)
+    seasonality = generate_seasonality(n, config.seasonality_amplitude_4w, config.seasonality_amplitude_52w)
+    noise = rng.normal(0, config.noise_std, n)
+    control_effect = df[config.col_interest_rate] * config.interest_rate_coef
+    
+    absolute_trend = config.base_sales + trend
+    
+    # Save latents to dataframe for counterfactual reconstruction later
+    df['latent_trend'] = absolute_trend 
+    df['latent_seasonality'] = seasonality
+    df['latent_noise'] = noise
+    df['latent_control_effect'] = control_effect
+    
+    # 3. Generate Spend, Transformations & Pricing Interactions
+    transformed_data = {}
+    sales_contribution_media = np.zeros(n)
+    cheapest_mask = df[config.col_cheapest_flag] == 1
+    
+    for ch in config.channels:
+        params = config.channel_params[ch]
+        
+        df[ch] = generate_spiky_spend(
+            n, params["spend_prob"], params["spend_mean"], params["spend_std"], params["spend_min_clip"], rng
+        )
+        
+        adstocked = geometric_adstock(df[ch].values, params["theta"])
+        saturated = hill_function(adstocked, params["alpha"], params["gamma"])
+        
+        active_coef = np.where(cheapest_mask, params["coef_if_cheapest"], params["coef_if_not_cheapest"])
+        contribution = saturated * active_coef
+        
+        transformed_data[ch] = {
+            'adstocked': adstocked,
+            'saturated_contribution': contribution
+        }
+        
+        sales_contribution_media += contribution
+
+    # 4. Assemble Target Variable
+    df[config.col_target] = (
+        absolute_trend + 
+        seasonality +
+        sales_contribution_media +
+        control_effect +
+        noise
+    ).clip(0, None)
+    
+    transformed_data['latent'] = {
+        'trend': absolute_trend,
+        'seasonality': seasonality
+    }
+    
+    return df, transformed_data
+
+
+def calculate_true_sales(df: pd.DataFrame, config: MMMConfig) -> np.ndarray:
+    """Calculates ground truth sales from given spend and saved latents."""
+    sales_contrib = np.zeros(len(df))
+    cheapest_mask = df[config.col_cheapest_flag] == 1
+
+    for ch in config.channels:
+        params = config.channel_params[ch]
+        adstocked = geometric_adstock(df[ch].values, params["theta"])
+        saturated = hill_function(adstocked, params["alpha"], params["gamma"])
+        active_coef = np.where(cheapest_mask, params["coef_if_cheapest"], params["coef_if_not_cheapest"])
+        sales_contrib += saturated * active_coef
+
+    true_sales = (
+        df['latent_trend'] + 
+        df['latent_seasonality'] + 
+        df['latent_control_effect'] + 
+        df['latent_noise'] + 
+        sales_contrib
+    ).clip(0, None)
+    
+    return true_sales
+
+################################################################################
+# FILE: /home/cteriet/Documents/projects/mmm/simulation/transformation.py
+################################################################################
+
+import numpy as np
+
+def geometric_adstock(spend: np.ndarray, theta: float) -> np.ndarray:
+    """
+    Applies geometric decay (adstock) to a spend array.
+    
+    Args:
+        spend: Array of spend values per time step.
+        theta: Decay rate parameter (0 <= theta < 1).
+        
+    Returns:
+        Array of adstocked spend values.
+    """
+    adstocked = np.zeros_like(spend, dtype=float)
+    if len(spend) > 0:
+        adstocked[0] = spend[0]
+        for t in range(1, len(spend)):
+            adstocked[t] = spend[t] + theta * adstocked[t-1]
+    return adstocked
+
+def hill_function(x: np.ndarray, alpha: float, gamma: float) -> np.ndarray:
+    """
+    Applies the Hill function for saturation.
+    
+    Args:
+        x: Array of input values (typically adstocked spend).
+        alpha: Shape parameter (controls the 'S' shape steepness).
+        gamma: Half-saturation point.
+        
+    Returns:
+        Saturated values (between 0 and 1).
+    """
+    # Add epsilon to prevent division by zero
+    epsilon = 1e-8
+    x_safe = np.clip(x, epsilon, None)
+    return 1.0 / (1.0 + (gamma / x_safe) ** alpha)
+
+################################################################################
+# FILE: /home/cteriet/Documents/projects/mmm/simulation/__init__.py
+################################################################################
+
+
+
+################################################################################
+# FILE: /home/cteriet/Documents/projects/mmm/simulation/analysis.py
+################################################################################
+
+import pymc as pm
+import pytensor
+import pytensor.tensor as pt
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import Dict, Any, Tuple
+import arviz as az
+import matplotlib.gridspec as gridspec
+from scipy.stats import gaussian_kde
+
+def geometric_adstock_pt(spend: pt.TensorVariable, theta: pt.TensorVariable) -> pt.TensorVariable:
+    """PyTensor implementation of geometric adstock using scan."""
+    def step(x_t: pt.TensorVariable, y_tm1: pt.TensorVariable, theta: pt.TensorVariable) -> pt.TensorVariable:
+        return x_t + theta * y_tm1
+    
+    outputs, _ = pytensor.scan(
+        fn=step,
+        sequences=[spend],
+        outputs_info=[pt.as_tensor_variable(np.array(0.0, dtype=spend.dtype))],
+        non_sequences=[theta],
+        strict=True
+    )
+    return outputs
+
+def hill_function_pt(x: pt.TensorVariable, alpha: pt.TensorVariable, gamma: pt.TensorVariable) -> pt.TensorVariable:
+    """PyTensor implementation of the Hill function."""
+    epsilon = 1e-8
+    x_safe = pt.clip(x, epsilon, np.inf)
+    return 1.0 / (1.0 + (gamma / x_safe) ** alpha)
+
+def create_prior(name: str, prior_spec: Dict[str, Any]):
+    """Helper to dynamically instantiate PyMC distributions from config."""
+    dist_class = getattr(pm, prior_spec['dist'])
+    return dist_class(name, **prior_spec['kwargs'])
+
+def build_mmm_model(df: pd.DataFrame, config_dict: Dict[str, Any], priors_dict: Dict[str, Any]) -> pm.Model:
+    n_weeks: int = len(df)
+    time_idx: np.ndarray = np.arange(n_weeks)
+    
+    sales: np.ndarray = df[config_dict['col_target']].values
+    interest_rate: np.ndarray = df[config_dict['col_interest_rate']].values
+    is_cheapest: np.ndarray = df[config_dict['col_cheapest_flag']].values
+    channels: list[str] = config_dict['channels']
+
+    p_global = priors_dict["global"]
+
+    with pm.Model() as mmm:
+        time_data = pm.Data("time_data", time_idx)
+        interest_data = pm.Data("interest_data", interest_rate)
+        cheapest_data = pm.Data("cheapest_data", is_cheapest)
+        
+        spend_vars = {
+            ch: pm.Data(f"{ch}_spend_data", df[ch].values) 
+            for ch in channels
+        }
+
+        # Latent Trend & Seasonality
+        sigma_trend = create_prior("sigma_trend", p_global["sigma_trend"])
+        
+        # Init dist for GaussianRandomWalk is special as it needs `.dist()`
+        init_spec = p_global["trend_init"]
+        init_dist = getattr(pm, init_spec['dist']).dist(**init_spec['kwargs'])
+        
+        trend = pm.GaussianRandomWalk("trend", sigma=sigma_trend, shape=n_weeks, init_dist=init_dist)
+        
+        amp_4w = create_prior("amp_4w", p_global["amp_4w"])
+        amp_52w = create_prior("amp_52w", p_global["amp_52w"])
+        seasonality = amp_4w * pt.sin(2 * np.pi * time_data / 4) + amp_52w * pt.sin(2 * np.pi * time_data / 52)
+        
+        # Controls
+        coef_interest = create_prior("coef_interest", p_global["coef_interest"])
+        control_effect = coef_interest * interest_data
+        
+        media_effects = []
+        for ch in channels:
+            p_ch = priors_dict["channels"][ch]
+            
+            theta = create_prior(f"{ch}_theta", p_ch["theta"])
+            alpha = create_prior(f"{ch}_alpha", p_ch["alpha"])
+            gamma = create_prior(f"{ch}_gamma", p_ch["gamma"])
+            
+            coef_cheap = create_prior(f"{ch}_coef_cheap", p_ch["coef_cheap"])
+            coef_not_cheap = create_prior(f"{ch}_coef_not_cheap", p_ch["coef_not_cheap"])
+            
+            adstocked = geometric_adstock_pt(spend_vars[ch], theta)
+            saturated = hill_function_pt(adstocked, alpha, gamma)
+            
+            active_coef = pt.switch(cheapest_data, coef_cheap, coef_not_cheap)
+            channel_effect = pm.Deterministic(f"{ch}_effect", saturated * active_coef)
+            media_effects.append(channel_effect)
+            
+        total_media = pm.math.sum(media_effects, axis=0)
+        
+        # Likelihood
+        mu = trend + seasonality + control_effect + total_media
+        mu_safe = pt.clip(mu, 0.1, np.inf) 
+        sigma_obs = create_prior("sigma_obs", p_global["sigma_obs"])
+        
+        pm.Normal("obs", mu=mu_safe, sigma=sigma_obs, observed=sales)
+        
+    return mmm
+
+def run_mmm_analysis(df: pd.DataFrame, config_dict: Dict[str, Any], priors_dict: Dict[str, Any]) -> Tuple[pm.Model, az.InferenceData]:
+    """Runs the MCMC sampling using the extracted model builder."""
+    mmm = build_mmm_model(df, config_dict, priors_dict)
+    
+    with mmm:
+        trace = pm.sample(draws=1500, tune=1000, chains=4, target_accept=0.95, random_seed=config_dict.get('random_seed', 42))
+        pm.sample_posterior_predictive(trace, extend_inferencedata=True, random_seed=config_dict.get('random_seed', 42))
+        
+    return mmm, trace
+
+def plot_parameter_recovery(trace: az.InferenceData, config_dict: Dict[str, Any], save_path: str) -> None:
+    """Plots posterior estimates against ground-truth configuration values and saves to disk."""
+    channels: list[str] = config_dict['channels']
+    config_params: Dict[str, Any] = config_dict['channel_params']
+    
+    # Setup plotting grids
+    metrics: list[str] = ["theta", "alpha", "gamma", "coef_if_cheapest", "coef_if_not_cheapest"]
+    name_mapping: Dict[str, str] = {"coef_if_cheapest": "coef_cheap", "coef_if_not_cheapest": "coef_not_cheap"}
+
+    # We add +1 to rows for the "Global Parameters" row
+    fig, axes = plt.subplots(len(channels) + 1, len(metrics), figsize=(20, 3 * (len(channels) + 1)))
+    plt.subplots_adjust(hspace=0.6, wspace=0.3)
+    
+    # --- Plot Global Parameters (Row 0) ---
+    global_vars = ["coef_interest", "amp_4w", "amp_52w"]
+    true_globals = {
+        "coef_interest": config_dict["interest_rate_coef"],
+        "amp_4w": config_dict["seasonality_amplitude_4w"],
+        "amp_52w": config_dict["seasonality_amplitude_52w"]
+    }
+    
+    for j, g_var in enumerate(global_vars):
+        ax = axes[0, j]
+        posterior_samples = trace.posterior[g_var].values.flatten()
+        ax.hist(posterior_samples, bins=40, density=True, color='lightgreen', alpha=0.7, label='Posterior')
+        ax.axvline(true_globals[g_var], color='red', linestyle='--', linewidth=2, label='True Value')
+        ax.set_title(f"GLOBAL\n{g_var}")
+        if j == 0: ax.legend()
+        ax.set_yticks([]) 
+        
+    # Hide unused subplots in the first row
+    for j in range(len(global_vars), len(metrics)):
+        axes[0, j].axis('off')
+
+    # --- Plot Channel Parameters (Rows 1+) ---
+    for i, ch in enumerate(channels):
+        row_idx = i + 1
+        for j, metric in enumerate(metrics):
+            ax = axes[row_idx, j]
+            trace_suffix = name_mapping.get(metric, metric)
+            var_name = f"{ch}_{trace_suffix}"
+            
+            posterior_samples = trace.posterior[var_name].values.flatten()
+            ax.hist(posterior_samples, bins=40, density=True, color='skyblue', alpha=0.7, label='Posterior')
+            true_val = config_params[ch][metric]
+            ax.axvline(true_val, color='red', linestyle='--', linewidth=2, label='True Value')
+            ax.set_title(f"{ch}\n{metric}")
+            ax.set_yticks([]) 
+            
+    plt.suptitle("Parameter Recovery: Ground Truth vs. Estimated Posterior", fontsize=18, y=1.02)
+    plt.savefig(save_path, bbox_inches='tight', dpi=300)
+    print(f"Recovery plot saved to {save_path}")
+    plt.close()
+
+def plot_posterior_predictive(
+    trace: az.InferenceData, 
+    df: pd.DataFrame, 
+    config_dict: Dict[str, Any], 
+    save_path: str, 
+    group: str = 'posterior_predictive',
+    true_cf_sales: np.ndarray = None  # <--- NEW ARGUMENT
+) -> None:
+    sales = df[config_dict['col_target']].values
+    time_idx = df[config_dict['col_time']].values
+    
+    # Dynamically select the group based on the parameter
+    pp_sales = getattr(trace, group)['obs']
+    
+    sales_mean = pp_sales.mean(dim=['chain', 'draw'])
+    sales_hdi = az.hdi(pp_sales, prob=0.95)
+    
+    plt.figure(figsize=(14, 6))
+    plt.plot(time_idx, sales, color='black', label='Observed Sales', linewidth=2)
+    plt.plot(time_idx, sales_mean, color='orange', label='Estimated Sales (Mean)', linestyle='--', linewidth=2)
+    
+    # <--- NEW: Plot True CF Sales if provided --->
+    if true_cf_sales is not None:
+        plt.plot(time_idx, true_cf_sales, color='green', label='True Counterfactual Sales', linestyle='-.', linewidth=2)
+    
+    # Safely handle the HDI dimension name depending on the Arviz version
+    dim_name = 'ci_bound' if 'ci_bound' in sales_hdi.dims else 'hdi'
+    
+    plt.fill_between(time_idx, 
+                     sales_hdi.isel({dim_name: 0}), 
+                     sales_hdi.isel({dim_name: 1}), 
+                     color='orange', alpha=0.3, label='95% Credible Interval')
+    
+    price = config_dict['price_per_unit']
+    ax = plt.gca()
+    sec_ax = ax.secondary_yaxis('right', functions=(lambda x: x * price, lambda x: x / price))
+    sec_ax.set_ylabel('Money Earned ($)', fontsize=12)
+    
+    plt.title('Model Fit: Observed Sales vs Posterior Predictive', fontsize=16)
+    plt.xlabel('Week', fontsize=12)
+    plt.ylabel('Sales', fontsize=12)
+    plt.legend(loc='upper left')
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    
+    plt.savefig(save_path, bbox_inches='tight', dpi=300)
+    print(f"Posterior predictive plot saved to {save_path}")
+    plt.close()
+
+def plot_total_sales_counterfactual(
+    trace: az.InferenceData,
+    df_original: pd.DataFrame,
+    true_cf_sales: np.ndarray,
+    config_dict: Dict[str, Any],
+    save_path: str,
+    group: str = 'predictions'
+) -> None:
+    """Plots the posterior distribution of total predicted sales against observed and true counterfactual totals."""
+    # 1. Calculate deterministic totals
+    obs_total = df_original[config_dict['col_target']].sum()
+    true_cf_total = true_cf_sales.sum()
+
+    # 2. Extract distribution of predicted totals
+    pp_sales = getattr(trace, group)['obs']
+    # Dynamically find the time dimension to sum over (ignoring chain and draw)
+    time_dim = [d for d in pp_sales.dims if d not in ('chain', 'draw')][0]
+    pred_totals = pp_sales.sum(dim=time_dim).values.flatten()
+
+    # 3. Plotting
+    plt.figure(figsize=(10, 6))
+    plt.hist(pred_totals, bins=40, density=True, alpha=0.7, color='skyblue', label='Predicted CF Total Sales (Distribution)')
+
+    plt.axvline(obs_total, color='black', linestyle='-', linewidth=2, label=f'Observed Total ({obs_total:.0f})')
+    plt.axvline(true_cf_total, color='green', linestyle='--', linewidth=2, label=f'True CF Total ({true_cf_total:.0f})')
+
+    # Add 95% HDI lines for the predicted total
+    lower, upper = np.percentile(pred_totals, [2.5, 97.5])
+    plt.axvline(lower, color='orange', linestyle=':', linewidth=2, label='95% HDI (Predicted)')
+    plt.axvline(upper, color='orange', linestyle=':', linewidth=2)
+
+    price = config_dict['price_per_unit']
+    ax = plt.gca()
+    sec_ax = ax.secondary_yaxis('right', functions=(lambda x: x * price, lambda x: x / price))
+    sec_ax.set_ylabel('Money Earned ($)', fontsize=12)
+
+    plt.title('Total Sales: Observed vs. True Counterfactual vs. Predicted Distribution', fontsize=14)
+    plt.xlabel('Total Sales', fontsize=12)
+    plt.ylabel('Density', fontsize=12)
+    plt.legend(loc='upper left')
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+
+    plt.savefig(save_path, bbox_inches='tight', dpi=300)
+    print(f"Total sales counterfactual plot saved to {save_path}")
+    plt.close()
+
+
+def plot_response_curves(trace: az.InferenceData, df: pd.DataFrame, config_dict: Dict[str, Any], save_path: str) -> None:
+    """Plots Saturation (Response) and Profit (ROI) curves for each channel, with a marginal spend density plot."""
+    channels = config_dict['channels']
+    price = config_dict['price_per_unit']
+    config_params = config_dict['channel_params']
+    
+    # Calculate the historical probability of being the cheapest to weight the coefficients
+    p_cheap = df[config_dict['col_cheapest_flag']].mean()
+    
+    # Use GridSpec for complex layouts (Main plot + marginal density plot)
+    fig = plt.figure(figsize=(16, 6 * len(channels)))
+    outer_gs = gridspec.GridSpec(len(channels), 2, hspace=0.4, wspace=0.3)
+    
+    for i, ch in enumerate(channels):
+        # --- Layout Setup ---
+        # 80% height for the main curve, 20% for the KDE plot, minimal vertical space
+        inner_gs_resp = gridspec.GridSpecFromSubplotSpec(2, 1, subplot_spec=outer_gs[i, 0], height_ratios=[4, 1], hspace=0.05)
+        ax_resp = fig.add_subplot(inner_gs_resp[0, 0])
+        ax_resp_kde = fig.add_subplot(inner_gs_resp[1, 0], sharex=ax_resp)
+        
+        inner_gs_prof = gridspec.GridSpecFromSubplotSpec(2, 1, subplot_spec=outer_gs[i, 1], height_ratios=[4, 1], hspace=0.05)
+        ax_prof = fig.add_subplot(inner_gs_prof[0, 0])
+        ax_prof_kde = fig.add_subplot(inner_gs_prof[1, 0], sharex=ax_prof)
+        
+        # --- Data Prep ---
+        max_spend = df[ch].max()
+        x_range = np.linspace(0, max_spend * 1.5, 100)
+        hist_spend = df[ch].values
+
+        # Remove the zero spend days from the KDE plot
+        hist_spend = hist_spend[hist_spend > 0]
+        
+        # Calculate KDE for the historical spend distribution
+        try:
+            kde = gaussian_kde(hist_spend)
+            kde_y = kde(x_range)
+        except np.linalg.LinAlgError:
+            # Fallback if there is zero variance in the spend (e.g., all 0s)
+            kde_y = np.zeros_like(x_range)
+        
+        # --- Extract Posterior & Config Parameters ---
+        alpha = trace.posterior[f"{ch}_alpha"].values.flatten()[:, None]
+        gamma = trace.posterior[f"{ch}_gamma"].values.flatten()[:, None]
+        coef_c = trace.posterior[f"{ch}_coef_cheap"].values.flatten()[:, None]
+        coef_nc = trace.posterior[f"{ch}_coef_not_cheap"].values.flatten()[:, None]
+        
+        # Blend the coefficient based on state probability
+        coef = (p_cheap * coef_c) + ((1 - p_cheap) * coef_nc)
+        
+        true_alpha = config_params[ch]['alpha']
+        true_gamma = config_params[ch]['gamma']
+        true_coef_c = config_params[ch]['coef_if_cheapest']
+        true_coef_nc = config_params[ch]['coef_if_not_cheapest']
+        true_coef = (p_cheap * true_coef_c) + ((1 - p_cheap) * true_coef_nc)
+        
+        # --- Calculate Curves ---
+        epsilon = 1e-8
+        x_safe = np.clip(x_range, epsilon, None)
+        
+        response_draws = coef * (1.0 / (1.0 + (gamma / x_safe)**alpha))
+        profit_draws = (response_draws * price) - x_range
+        
+        resp_mean = response_draws.mean(axis=0)
+        resp_lower = np.percentile(response_draws, 2.5, axis=0)
+        resp_upper = np.percentile(response_draws, 97.5, axis=0)
+        
+        prof_mean = profit_draws.mean(axis=0)
+        prof_lower = np.percentile(profit_draws, 2.5, axis=0)
+        prof_upper = np.percentile(profit_draws, 97.5, axis=0)
+        
+        true_response = true_coef * (1.0 / (1.0 + (true_gamma / x_safe)**true_alpha))
+        true_profit = (true_response * price) - x_range
+        
+        # ==========================================
+        # 1. Plot Response (Saturation)
+        # ==========================================
+        ax_resp.plot(x_range, resp_mean, color='blue', linewidth=2, label='Mean Response')
+        ax_resp.plot(x_range, true_response, color='purple', linestyle='--', linewidth=2, label='True Response')
+        ax_resp.fill_between(x_range, resp_lower, resp_upper, color='blue', alpha=0.2, label='95% HDI')
+        
+        ax_resp.set_title(f"{ch}: Saturation Curve")
+        ax_resp.set_ylabel("Incremental Sales (Units)")
+        ax_resp.legend(loc='upper left')
+        ax_resp.grid(alpha=0.3)
+        plt.setp(ax_resp.get_xticklabels(), visible=False) # Hide x-ticks for the main plot
+        
+        # Secondary axis for Money
+        sec_ax_resp = ax_resp.secondary_yaxis('right', functions=(lambda x: x * price, lambda x: x / price))
+        sec_ax_resp.set_ylabel("Incremental Revenue ($)")
+        
+        # Plot KDE for Response
+        ax_resp_kde.fill_between(x_range, 0, kde_y, color='gray', alpha=0.4)
+        ax_resp_kde.plot(x_range, kde_y, color='black', alpha=0.6, linewidth=1)
+        ax_resp_kde.set_xlabel("Money Invested ($)")
+        ax_resp_kde.set_ylabel("Density")
+        ax_resp_kde.set_yticks([]) # Hide the y-axis ticks as it's just a visual reference
+        
+        # ==========================================
+        # 2. Plot Profit (ROI)
+        # ==========================================
+        ax_prof.plot(x_range, prof_mean, color='green', linewidth=2, label='Mean Profit')
+        ax_prof.plot(x_range, true_profit, color='purple', linestyle='--', linewidth=2, label='True Profit')
+        ax_prof.fill_between(x_range, prof_lower, prof_upper, color='green', alpha=0.2, label='95% HDI')
+        ax_prof.axhline(0, color='red', linestyle='--', linewidth=1) # Break-even line
+        
+        ax_prof.set_title(f"{ch}: Profit (ROI) Curve")
+        ax_prof.set_ylabel("Profit ($)")
+        ax_prof.legend(loc='upper left')
+        ax_prof.grid(alpha=0.3)
+        plt.setp(ax_prof.get_xticklabels(), visible=False) # Hide x-ticks for the main plot
+        
+        # Plot KDE for Profit
+        ax_prof_kde.fill_between(x_range, 0, kde_y, color='gray', alpha=0.4)
+        ax_prof_kde.plot(x_range, kde_y, color='black', alpha=0.6, linewidth=1)
+        ax_prof_kde.set_xlabel("Money Invested ($)")
+        ax_prof_kde.set_ylabel("Density")
+        ax_prof_kde.set_yticks([]) # Hide the y-axis ticks
+        
+    # We no longer use plt.tight_layout() here because it conflicts with GridSpec spacing
+    plt.savefig(save_path, bbox_inches='tight', dpi=300)
+    print(f"Response and Profit curves saved to {save_path}")
+    plt.close()
