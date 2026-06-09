@@ -28,18 +28,19 @@ def run_meridian_analysis(csv_path: str, config_path: str, out_plot_prefix: str)
     with open(config_path, "r") as f:
         config = json.load(f)
         
-    # Meridian often requires 'geo' and 'population' columns
     if "geo" not in df.columns:
         df["geo"] = "national"
     if "population" not in df.columns:
         df["population"] = 1.0
 
-    # --- NEW: Generate a mock date string for Meridian ---
-    # We pick an arbitrary start date and add 'week' number of weeks to it.
+    # Mock date for Meridian's strict time coordinate validation
     start_date = pd.to_datetime("2023-01-01")
     df["mock_date"] = start_date + pd.to_timedelta(df["week"], unit="W")
     df["mock_date"] = df["mock_date"].dt.strftime("%Y-%m-%d")
-    # -----------------------------------------------------
+
+    # --- NEW: Convert Sales to Revenue to unlock flexible priors ---
+    price = config.get("price_per_unit", 1.0)
+    df["revenue"] = df["sales"] * price
 
     # ---------------------------------------------------------
     # 2. Build Meridian Input Data
@@ -47,18 +48,19 @@ def run_meridian_analysis(csv_path: str, config_path: str, out_plot_prefix: str)
     media_channels = ["tv_spend", "digital_spend", "radio_spend"]
     control_vars = ["interest_rate", "comp_tv_spend"] 
 
+    # --- NEW: Set KPI type to revenue ---
     builder = data_frame_input_data_builder.DataFrameInputDataBuilder(
-        kpi_type="non_revenue", 
-        default_kpi_column="sales"
+        kpi_type="revenue", 
+        default_kpi_column="revenue"
     )
 
     builder = (
-        builder.with_kpi(df, kpi_col="sales", geo_col="geo", time_col="mock_date")
+        builder.with_kpi(df, kpi_col="revenue", geo_col="geo", time_col="mock_date")
         .with_media(
             df, 
             media_cols=media_channels, 
             media_spend_cols=media_channels, 
-            media_channels=media_channels,  # <-- This was the missing argument
+            media_channels=media_channels,
             geo_col="geo", 
             time_col="mock_date"
         )
@@ -71,13 +73,10 @@ def run_meridian_analysis(csv_path: str, config_path: str, out_plot_prefix: str)
     # ---------------------------------------------------------
     # 3. Model Specification & Fitting
     # ---------------------------------------------------------
-    # We initialize the default model specification. You can inject custom
-    # prior_distribution.PriorDistribution() here if needed.
     model_spec = spec.ModelSpec()
     mmm = model.Meridian(input_data=input_data, model_spec=model_spec)
     
     print("Fitting the Meridian model via NUTS. This may take a few minutes...")
-    # Adjust chains and draws based on your hardware (GPU recommended for Meridian)
     mmm.sample_posterior(n_chains=4, n_adapt=1000, n_burnin=1000, n_keep=1000, seed=42)
 
     # ---------------------------------------------------------
@@ -86,68 +85,85 @@ def run_meridian_analysis(csv_path: str, config_path: str, out_plot_prefix: str)
     trace = mmm.inference_data
     channel_params = config.get("channel_params", {})
     
-    fig, axes = plt.subplots(len(media_channels), 2, figsize=(14, 5 * len(media_channels)))
+    fig, axes = plt.subplots(len(media_channels), 4, figsize=(20, 4 * len(media_channels)), squeeze=False)
     fig.subplots_adjust(hspace=0.4, wspace=0.3)
 
     for i, ch in enumerate(media_channels):
-        if ch not in channel_params:
-            continue
+        conf_key = ch
+        if conf_key not in channel_params and conf_key.replace("_spend", "") in channel_params:
+            conf_key = conf_key.replace("_spend", "")
             
-        # Ground truth values from simple_config.json
-        gt_theta = channel_params[ch].get("theta")
-        gt_alpha = channel_params[ch].get("alpha")
+        gt_theta, gt_alpha, gt_ec, gt_coef = None, None, None, None
         
+        if conf_key in channel_params:
+            gt_theta = channel_params[conf_key].get("theta")      
+            gt_alpha = channel_params[conf_key].get("alpha")      
+            gt_ec = channel_params[conf_key].get("half_max")      
+            gt_coef = channel_params[conf_key].get("beta")        
+        
+        # --- NEW: Scale the ground truth to match Meridian's internal scaling ---
+        if gt_ec is not None:
+            mean_spend = df[ch].mean()
+            gt_ec_scaled = gt_ec / mean_spend
+        else:
+            gt_ec_scaled = None
+
         try:
-            # Extract samples using ArviZ from Meridian's posterior
-            # Note: Parameter names map to Meridian's internal naming schema
-            adstock_samples = trace.posterior["adstock_decay"].sel(media_channel=ch).values.flatten()
-            hill_samples = trace.posterior["hill_slope"].sel(media_channel=ch).values.flatten()
+            # 1. Adstock Decay (alpha_m) - Scale Invariant
+            adstock_samples = trace.posterior["alpha_m"].sel(media_channel=ch).values.flatten()
+            kwargs_adstock = {"point_estimate": "mean"}
+            if gt_theta is not None: kwargs_adstock["ref_val"] = gt_theta
+            az.plot_posterior(adstock_samples, ax=axes[i, 0], **kwargs_adstock)
+            axes[i, 0].set_title(f"{ch}\nAdstock Decay (alpha_m)")
 
-            # Plot Adstock Decay (Theta)
-            az.plot_posterior(adstock_samples, ax=axes[i, 0], point_estimate="mean", ref_val=gt_theta)
-            axes[i, 0].set_title(f"{ch} - Adstock Decay (Recovery)")
+            # 2. Hill Slope (slope_m) - Scale Invariant
+            hill_samples = trace.posterior["slope_m"].sel(media_channel=ch).values.flatten()
+            kwargs_hill = {"point_estimate": "mean"}
+            if gt_alpha is not None: kwargs_hill["ref_val"] = gt_alpha
+            az.plot_posterior(hill_samples, ax=axes[i, 1], **kwargs_hill)
+            axes[i, 1].set_title(f"{ch}\nHill Slope (slope_m)")
 
-            # Plot Hill Slope (Alpha)
-            az.plot_posterior(hill_samples, ax=axes[i, 1], point_estimate="mean", ref_val=gt_alpha)
-            axes[i, 1].set_title(f"{ch} - Hill Slope (Recovery)")
+            # 3. Half-Saturation Point (ec_m) - Plotted against SCALED ground truth
+            ec_samples = trace.posterior["ec_m"].sel(media_channel=ch).values.flatten()
+            kwargs_ec = {"point_estimate": "mean"}
+            if gt_ec_scaled is not None: kwargs_ec["ref_val"] = gt_ec_scaled
+            az.plot_posterior(ec_samples, ax=axes[i, 2], **kwargs_ec)
+            axes[i, 2].set_title(f"{ch}\nHalf-Saturation (ec_m)\n*Scaled vs Mean Spend")
+
+            # 4. Media Coefficient (beta_m)
+            # Note: Meridian scales beta_m relative to BOTH the KPI and Spend. 
+            # We plot the posterior here, but omit the ref_val because exact un-scaling 
+            # requires extracting Meridian's internal KPI scaler.
+            coef_samples = trace.posterior["beta_m"].sel(media_channel=ch).values.flatten()
+            az.plot_posterior(coef_samples, ax=axes[i, 3], point_estimate="mean")
+            axes[i, 3].set_title(f"{ch}\nCoefficient (beta_m)\n*Internally Scaled")
             
         except KeyError as e:
             print(f"Skipping {ch} plots. Trace variable not found: {e}")
+            for col in range(4):
+                axes[i, col].text(0.5, 0.5, "Data not found", ha='center', va='center')
 
-    plt.suptitle("Meridian Parameter Recovery vs Ground Truth", fontsize=16)
-    plt.savefig(f"{out_plot_prefix}_parameter_recovery.png", bbox_inches="tight")
+    plt.suptitle("Meridian Parameter Recovery vs Ground Truth", fontsize=18, y=1.05)
+    plt.tight_layout()
+    plt.savefig(f"{out_plot_prefix}_parameter_recovery.png")
     plt.close()
 
     # ---------------------------------------------------------
     # 5. Response & Profit Curves
     # ---------------------------------------------------------
-    print("Generating Response and Profit Curves...")
+    print("Generating Response Curves using Meridian Visualizer...")
+    from meridian.analysis import visualizer
+    media_effects = visualizer.MediaEffects(mmm)
     
-    # Meridian's Analyzer class handles the extraction of expected responses
-    mmm_analyzer = analyzer.Analyzer(mmm)
+    response_chart = media_effects.plot_response_curves(
+        plot_separately=True, 
+        include_ci=True
+    )
     
-    # Extract the response curve data
-    # (Meridian provides standard evaluation grids for this)
-    response_data = mmm_analyzer.expected_response_curves()
+    html_path = f"{out_plot_prefix}_response_curves.html"
+    response_chart.save(html_path)
     
-    fig_rc, ax_rc = plt.subplots(figsize=(10, 6))
-    for ch in media_channels:
-        # Plotting the mean expected response across the spend grid
-        spend_grid = response_data[ch]["spend_grid"]
-        response_mean = response_data[ch]["response_mean"]
-        
-        ax_rc.plot(spend_grid, response_mean, label=f"{ch} Response", linewidth=2)
-        
-    ax_rc.set_title("Media Response Curves (Saturation)")
-    ax_rc.set_xlabel("Spend ($)")
-    ax_rc.set_ylabel("Incremental Sales")
-    ax_rc.legend()
-    ax_rc.grid(True, alpha=0.3)
-    
-    plt.savefig(f"{out_plot_prefix}_response_curves.png", bbox_inches="tight")
-    plt.close()
-
-    print(f"Done! Plots saved with prefix: {out_plot_prefix}")
+    print(f"Done! Parameter recovery saved to {out_plot_prefix}_parameter_recovery.png")
     return mmm
 
 def geometric_adstock_pt(spend: pt.TensorVariable, theta: pt.TensorVariable) -> pt.TensorVariable:
