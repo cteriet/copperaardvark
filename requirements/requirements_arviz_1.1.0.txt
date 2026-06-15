@@ -1,0 +1,13 @@
+numpy
+pandas
+matplotlib
+jupyterlab
+arviz
+pymc
+pytensor
+
+# Required for saving traces
+h5netcdf
+h5py
+
+# required for faster inference/training

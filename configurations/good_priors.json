@@ -1,0 +1,40 @@
+{
+    "global": {
+        "sigma_trend": {"dist": "HalfNormal", "kwargs": {"sigma": 50}},
+        "trend_init": {"dist": "Normal", "kwargs": {"mu": 300, "sigma": 200}},
+        "amp_4w": {"dist": "Normal", "kwargs": {"mu": 0, "sigma": 100}},
+        "amp_52w": {"dist": "Normal", "kwargs": {"mu": 0, "sigma": 200}},
+        "coef_interest": {"dist": "Normal", "kwargs": {"mu": 0, "sigma": 100}},
+        "sigma_obs": {"dist": "HalfNormal", "kwargs": {"sigma": 100}}
+    },
+    "channels": {
+        "tv_spend": {
+            "theta": {"dist": "Beta", "kwargs": {"alpha": 2, "beta": 2}},
+            "alpha": {"dist": "Gamma", "kwargs": {"alpha": 3, "beta": 1.5}},
+            "gamma": {"dist": "HalfNormal", "kwargs": {"sigma": 5000}},
+            "coef_cheap": {"dist": "Normal", "kwargs": {"mu": 0, "sigma": 300}},
+            "coef_not_cheap": {"dist": "Normal", "kwargs": {"mu": 0, "sigma": 300}}
+        },
+        "digital_spend": {
+            "theta": {"dist": "Beta", "kwargs": {"alpha": 2, "beta": 2}},
+            "alpha": {"dist": "Gamma", "kwargs": {"alpha": 3, "beta": 1.5}},
+            "gamma": {"dist": "HalfNormal", "kwargs": {"sigma": 2000}},
+            "coef_cheap": {"dist": "Normal", "kwargs": {"mu": 0, "sigma": 300}},
+            "coef_not_cheap": {"dist": "Normal", "kwargs": {"mu": 0, "sigma": 300}}
+        },
+        "radio_spend": {
+            "theta": {"dist": "Beta", "kwargs": {"alpha": 2, "beta": 2}},
+            "alpha": {"dist": "Gamma", "kwargs": {"alpha": 3, "beta": 1.5}},
+            "gamma": {"dist": "HalfNormal", "kwargs": {"sigma": 1000}},
+            "coef_cheap": {"dist": "Normal", "kwargs": {"mu": 0, "sigma": 300}},
+            "coef_not_cheap": {"dist": "Normal", "kwargs": {"mu": 0, "sigma": 300}}
+        },
+        "comp_tv_spend": {
+            "theta": {"dist": "Beta", "kwargs": {"alpha": 2, "beta": 2}},
+            "alpha": {"dist": "Gamma", "kwargs": {"alpha": 3, "beta": 1.5}},
+            "gamma": {"dist": "HalfNormal", "kwargs": {"sigma": 6000}},
+            "coef_cheap": {"dist": "Normal", "kwargs": {"mu": 0, "sigma": 300}},
+            "coef_not_cheap": {"dist": "Normal", "kwargs": {"mu": 0, "sigma": 300}}
+        }
+    }
+}
